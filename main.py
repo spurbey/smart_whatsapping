@@ -188,63 +188,80 @@ async def twilio_whatsapp_webhook(request: Request, db: Session = Depends(get_db
         # Process incoming message using WhatsApp service
         processed_message = whatsapp_service.process_incoming_webhook(webhook_data)
         
-        # Find or create customer
-        customer = find_or_create_customer(
-            db=db, 
-            whatsapp_phone=processed_message['from_phone']
-        )
+        # Check for duplicate message
+        existing_msg = db.query(Message).filter(
+            Message.platform_message_id == processed_message['message_id']
+        ).first()
         
-        # Extract customer name from WhatsApp profile if available
-        profile_name = webhook_data.get('ProfileName', '')
-        if profile_name and not customer.first_name:
-            name_parts = profile_name.split(' ', 1)
-            customer.first_name = name_parts[0]
-            if len(name_parts) > 1:
-                customer.last_name = name_parts[1]
-            customer.updated_at = datetime.utcnow()
+        if existing_msg:
+            logger.info(f"📱 Duplicate message ignored: {processed_message['message_id']}")
+            return ""
         
-        # Save incoming message to database
-        incoming_msg = Message(
-            customer_id=customer.id,
-            channel="whatsapp",
-            direction="inbound",
-            content=processed_message['message_text'],
-            platform_message_id=processed_message['message_id'],
-            received_at=datetime.fromisoformat(processed_message['timestamp'].replace('Z', '+00:00')),
-            metadata_json=json.dumps({
-                "from_phone": processed_message['from_phone'],
-                "profile_name": profile_name,
-                "raw_webhook": webhook_data
-            })
-        )
-        db.add(incoming_msg)
-        
-        # Generate automated response
-        response_text = generate_response(processed_message['message_text'], customer, db)
-        
-        # Save response message to database
-        response_msg = Message(
-            customer_id=customer.id,
-            channel="whatsapp",
-            direction="outbound",
-            content=response_text,
-            sent_at=datetime.utcnow(),
-            bot_handled=True,
-            metadata_json=json.dumps({
-                "triggered_by_message": incoming_msg.id,
-                "response_type": "automated"
-            })
-        )
-        db.add(response_msg)
-        
-        # Commit all changes to database
-        db.commit()
-        
-        logger.info(f"✅ Processed WhatsApp message from {customer.first_name or processed_message['from_phone']}")
-        
-        # Return TwiML response to immediately reply to customer
-        twiml_response = whatsapp_service.generate_webhook_response(response_text)
-        return twiml_response
+        # Start database transaction
+        try:
+            # Find or create customer
+            customer = find_or_create_customer(
+                db=db, 
+                whatsapp_phone=processed_message['from_phone']
+            )
+            
+            # Extract customer name from WhatsApp profile if available
+            profile_name = webhook_data.get('ProfileName', '')
+            if profile_name and not customer.first_name:
+                name_parts = profile_name.split(' ', 1)
+                customer.first_name = name_parts[0]
+                if len(name_parts) > 1:
+                    customer.last_name = name_parts[1]
+                customer.updated_at = datetime.utcnow()
+            
+            # Save incoming message to database
+            incoming_msg = Message(
+                customer_id=customer.id,
+                channel="whatsapp",
+                direction="inbound",
+                content=processed_message['message_text'],
+                platform_message_id=processed_message['message_id'],
+                received_at=datetime.fromisoformat(processed_message['timestamp'].replace('Z', '+00:00')),
+                metadata_json=json.dumps({
+                    "from_phone": processed_message['from_phone'],
+                    "profile_name": profile_name,
+                    "raw_webhook": webhook_data
+                })
+            )
+            db.add(incoming_msg)
+            
+            # Generate automated response
+            response_text = generate_response(processed_message['message_text'], customer, db)
+            
+            # Save response message to database
+            response_msg = Message(
+                customer_id=customer.id,
+                channel="whatsapp",
+                direction="outbound",
+                content=response_text,
+                sent_at=datetime.utcnow(),
+                bot_handled=True,
+                metadata_json=json.dumps({
+                    "triggered_by_message": incoming_msg.id,
+                    "response_type": "automated"
+                })
+            )
+            db.add(response_msg)
+            
+            # Commit all changes to database as a single transaction
+            db.commit()
+            
+            logger.info(f"✅ Processed WhatsApp message from {customer.first_name or processed_message['from_phone']}")
+            
+            # Return TwiML response to immediately reply to customer
+            twiml_response = whatsapp_service.generate_webhook_response(response_text)
+            return twiml_response
+            
+        except Exception as db_error:
+            # Rollback transaction on any database error
+            db.rollback()
+            logger.error(f"❌ Database transaction failed: {db_error}")
+            raise db_error
         
     except Exception as e:
         logger.error(f"❌ WhatsApp webhook error: {e}")
@@ -261,51 +278,76 @@ def whatsapp_webhook_json(message: WebhookMessage, db: Session = Depends(get_db)
     logger.info(f"📱 Received JSON WhatsApp webhook from {message.from_phone}")
     
     try:
-        # Find/create customer
-        customer = find_or_create_customer(db=db, whatsapp_phone=message.from_phone)
+        # Check for duplicate message
+        existing_msg = db.query(Message).filter(
+            Message.platform_message_id == message.message_id
+        ).first()
         
-        # Update customer name if provided
-        if message.customer_name and not customer.first_name:
-            name_parts = message.customer_name.split(' ', 1)
-            customer.first_name = name_parts[0]
-            if len(name_parts) > 1:
-                customer.last_name = name_parts[1]
-            customer.updated_at = datetime.utcnow()
+        if existing_msg:
+            logger.info(f"📱 Duplicate test message ignored: {message.message_id}")
+            return {"status": "duplicate", "message_id": existing_msg.id}
         
-        # Save incoming message
-        incoming_msg = Message(
-            customer_id=customer.id,
-            channel="whatsapp",
-            direction="inbound",
-            content=message.message_text,
-            platform_message_id=message.message_id,
-            received_at=datetime.fromisoformat(message.timestamp.replace('Z', '+00:00'))
-        )
-        db.add(incoming_msg)
-        
-        # Generate response
-        response_text = generate_response(message.message_text, customer, db)
-        
-        # Save response message
-        response_msg = Message(
-            customer_id=customer.id,
-            channel="whatsapp",
-            direction="outbound",
-            content=response_text,
-            sent_at=datetime.utcnow(),
-            bot_handled=True
-        )
-        db.add(response_msg)
-        
-        # Commit all changes
-        db.commit()
-        
-        return {
-            "status": "success",
-            "customer_id": customer.id,
-            "message_id": incoming_msg.id,
-            "response": response_text
-        }
+        # Start database transaction
+        try:
+            # Find/create customer
+            customer = find_or_create_customer(db=db, whatsapp_phone=message.from_phone)
+            
+            # Update customer name if provided
+            if message.customer_name and not customer.first_name:
+                name_parts = message.customer_name.split(' ', 1)
+                customer.first_name = name_parts[0]
+                if len(name_parts) > 1:
+                    customer.last_name = name_parts[1]
+                customer.updated_at = datetime.utcnow()
+            
+            # Save incoming message
+            incoming_msg = Message(
+                customer_id=customer.id,
+                channel="whatsapp",
+                direction="inbound",
+                content=message.message_text,
+                platform_message_id=message.message_id,
+                received_at=datetime.fromisoformat(message.timestamp.replace('Z', '+00:00')),
+                metadata_json=json.dumps({
+                    "source": "json_webhook",
+                    "customer_name": message.customer_name
+                })
+            )
+            db.add(incoming_msg)
+            
+            # Generate response
+            response_text = generate_response(message.message_text, customer, db)
+            
+            # Save response message
+            response_msg = Message(
+                customer_id=customer.id,
+                channel="whatsapp",
+                direction="outbound",
+                content=response_text,
+                sent_at=datetime.utcnow(),
+                bot_handled=True,
+                metadata_json=json.dumps({
+                    "triggered_by_message": incoming_msg.id,
+                    "response_type": "automated_test"
+                })
+            )
+            db.add(response_msg)
+            
+            # Commit all changes as single transaction
+            db.commit()
+            
+            return {
+                "status": "success",
+                "customer_id": customer.id,
+                "message_id": incoming_msg.id,
+                "response": response_text
+            }
+            
+        except Exception as db_error:
+            # Rollback transaction on database error
+            db.rollback()
+            logger.error(f"❌ Database transaction failed: {db_error}")
+            raise db_error
         
     except Exception as e:
         logger.error(f"❌ JSON WhatsApp webhook error: {e}")
@@ -319,85 +361,102 @@ def shopify_webhook(order: ShopifyOrder, db: Session = Depends(get_db)):
     """
     logger.info(f"🛒 Received Shopify webhook for order {order.order_id}")
     
+    # Check for duplicate order
+    existing_order = db.query(Order).filter(
+        Order.platform_order_id == order.order_id,
+        Order.platform == "shopify"
+    ).first()
+    
+    if existing_order:
+        logger.info(f"🛒 Duplicate order ignored: {order.order_id}")
+        return {"status": "duplicate", "order_id": existing_order.id}
+    
     try:
-        # Log raw webhook for debugging
-        webhook_event = WebhookEvent(
-            source="shopify",
-            event_type="order.created",
-            raw_data=order.json()
-        )
-        db.add(webhook_event)
-        
-        # Find or create customer
-        customer = find_or_create_customer(db=db, email=order.customer_email)
-        
-        # Create order record
-        new_order = Order(
-            customer_id=customer.id,
-            platform_order_id=order.order_id,
-            platform="shopify",
-            total_price=order.total_price,
-            status=order.order_status,
-            items_json=json.dumps(order.items),
-            order_date=datetime.fromisoformat(order.created_at.replace('Z', '+00:00'))
-        )
-        db.add(new_order)
-        
-        # Update customer totals
-        customer.total_orders += order.total_price
-        customer.order_count += 1
-        customer.updated_at = datetime.utcnow()
-        
-        # Mark webhook as processed
-        webhook_event.processed = True
-        webhook_event.processed_at = datetime.utcnow()
-        
-        # Commit all changes
-        db.commit()
-        
-        # Trigger simple automations
-        automation_actions = trigger_simple_automations(customer, new_order)
-        
-        # Send order confirmation via WhatsApp if customer has WhatsApp
-        if customer.whatsapp_phone and whatsapp_service:
-            confirmation_message = f"🎉 Order confirmed! Your order {order.order_id} for ${order.total_price} is being processed. We'll update you on the status!"
-            try:
-                whatsapp_result = whatsapp_service.send_message(customer.whatsapp_phone, confirmation_message)
-                if whatsapp_result['status'] == 'sent':
-                    # Save the confirmation message to database
-                    confirmation_msg = Message(
-                        customer_id=customer.id,
-                        channel="whatsapp",
-                        direction="outbound",
-                        content=confirmation_message,
-                        platform_message_id=whatsapp_result['message_id'],
-                        sent_at=datetime.utcnow(),
-                        bot_handled=True,
-                        metadata_json=json.dumps({
-                            "trigger": "order_confirmation",
-                            "order_id": new_order.id
-                        })
-                    )
-                    db.add(confirmation_msg)
-                    db.commit()
-                    automation_actions.append("whatsapp_confirmation_sent")
-            except Exception as e:
-                logger.error(f"Failed to send WhatsApp order confirmation: {e}")
-        
-        return {
-            "status": "success",
-            "customer_id": customer.id,
-            "order_id": new_order.id,
-            "actions_triggered": automation_actions
-        }
+        # Start database transaction
+        try:
+            # Log raw webhook for debugging
+            webhook_event = WebhookEvent(
+                source="shopify",
+                event_type="order.created",
+                raw_data=order.json()
+            )
+            db.add(webhook_event)
+            
+            # Find or create customer
+            customer = find_or_create_customer(db=db, email=order.customer_email)
+            
+            # Create order record
+            new_order = Order(
+                customer_id=customer.id,
+                platform_order_id=order.order_id,
+                platform="shopify",
+                total_price=order.total_price,
+                status=order.order_status,
+                items_json=json.dumps(order.items),
+                order_date=datetime.fromisoformat(order.created_at.replace('Z', '+00:00'))
+            )
+            db.add(new_order)
+            
+            # Mark webhook as processed
+            webhook_event.processed = True
+            webhook_event.processed_at = datetime.utcnow()
+            
+            # Commit order and webhook data first
+            db.commit()
+            
+            # Recalculate customer totals from actual orders (more reliable)
+            from database import recalculate_customer_totals
+            recalculate_customer_totals(db, customer.id)
+            customer.updated_at = datetime.utcnow()
+            
+            # Commit customer updates
+            db.commit()
+            
+            # Trigger simple automations
+            automation_actions = trigger_simple_automations(customer, new_order)
+            
+            # Send order confirmation via WhatsApp if customer has WhatsApp
+            if customer.whatsapp_phone and whatsapp_service:
+                confirmation_message = f"🎉 Order confirmed! Your order {order.order_id} for ${order.total_price} is being processed. We'll update you on the status!"
+                try:
+                    whatsapp_result = whatsapp_service.send_message(customer.whatsapp_phone, confirmation_message)
+                    if whatsapp_result['status'] == 'sent':
+                        # Save the confirmation message to database
+                        confirmation_msg = Message(
+                            customer_id=customer.id,
+                            channel="whatsapp",
+                            direction="outbound",
+                            content=confirmation_message,
+                            platform_message_id=whatsapp_result['message_id'],
+                            sent_at=datetime.utcnow(),
+                            bot_handled=True,
+                            metadata_json=json.dumps({
+                                "trigger": "order_confirmation",
+                                "order_id": new_order.id
+                            })
+                        )
+                        db.add(confirmation_msg)
+                        db.commit()
+                        automation_actions.append("whatsapp_confirmation_sent")
+                except Exception as e:
+                    logger.error(f"Failed to send WhatsApp order confirmation: {e}")
+                    # Don't fail the whole webhook for WhatsApp errors
+            
+            return {
+                "status": "success",
+                "customer_id": customer.id,
+                "order_id": new_order.id,
+                "actions_triggered": automation_actions
+            }
+            
+        except Exception as db_error:
+            # Rollback transaction on database error
+            db.rollback()
+            logger.error(f"❌ Database transaction failed: {db_error}")
+            raise db_error
         
     except Exception as e:
         logger.error(f"❌ Shopify webhook error: {e}")
-        # Mark webhook as failed
-        if 'webhook_event' in locals():
-            webhook_event.processing_error = str(e)
-            webhook_event.processed_at = datetime.utcnow()
-            db.commit()
         raise HTTPException(status_code=500, detail=str(e))
 
 # WhatsApp messaging endpoints
@@ -815,7 +874,7 @@ def send_broadcast(request: BroadcastRequest, db: Session = Depends(get_db)):
 @app.get("/customers/segments")
 def get_customer_segments(db: Session = Depends(get_db)):
     """
-    Get customer segment statistics
+    Get customer segment statistics with improved segmentation
     """
     try:
         total_customers = db.query(Customer).count()
@@ -823,12 +882,37 @@ def get_customer_segments(db: Session = Depends(get_db)):
             Customer.whatsapp_phone.isnot(None)
         ).count()
         
+        # VIP customers (3+ orders OR $300+ spent)
         vip_customers = db.query(Customer).filter(
-            Customer.order_count >= 3
+            (Customer.order_count >= 3) | (Customer.total_orders >= 300)
         ).count()
         
+        # High value customers ($100-$299 spent)
+        high_value_customers = db.query(Customer).filter(
+            Customer.total_orders >= 100,
+            Customer.total_orders < 300
+        ).count()
+        
+        # Active customers (1-2 orders, under $100)
+        active_customers = db.query(Customer).filter(
+            Customer.order_count.between(1, 2),
+            Customer.total_orders < 100
+        ).count()
+        
+        # New customers (no orders yet)
         new_customers = db.query(Customer).filter(
             Customer.order_count == 0
+        ).count()
+        
+        # Inactive customers (no messages in 30 days but have ordered)
+        thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+        inactive_customers = db.query(Customer).filter(
+            Customer.order_count > 0,
+            ~Customer.id.in_(
+                db.query(Message.customer_id).filter(
+                    Message.created_at >= thirty_days_ago
+                ).distinct()
+            )
         ).count()
         
         return {
@@ -839,18 +923,110 @@ def get_customer_segments(db: Session = Depends(get_db)):
                 },
                 "vip": {
                     "total": vip_customers,
-                    "description": "Customers with 3+ orders"
+                    "description": "Customers with 3+ orders OR $300+ spent"
+                },
+                "high_value": {
+                    "total": high_value_customers,
+                    "description": "Customers with $100-$299 spent"
+                },
+                "active": {
+                    "total": active_customers,
+                    "description": "Customers with 1-2 orders, under $100"
                 },
                 "new": {
                     "total": new_customers,
                     "description": "Customers with 0 orders"
+                },
+                "inactive": {
+                    "total": inactive_customers,
+                    "description": "Customers with no messages in 30 days"
                 }
             }
         }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+@app.post("/admin/fix-customer-data")
+def fix_customer_data(db: Session = Depends(get_db)):
+    """
+    Fix existing customer data inconsistencies
+    """
+    try:
+        fixed_customers = 0
+        merged_customers = 0
+        
+        # Get all customers
+        all_customers = db.query(Customer).all()
+        
+        # Fix phone number formatting
+        from database import normalize_phone_number
+        for customer in all_customers:
+            changes_made = False
+            
+            if customer.phone:
+                normalized = normalize_phone_number(customer.phone)
+                if normalized != customer.phone:
+                    customer.phone = normalized
+                    changes_made = True
+            
+            if customer.whatsapp_phone:
+                normalized = normalize_phone_number(customer.whatsapp_phone)
+                if normalized != customer.whatsapp_phone:
+                    customer.whatsapp_phone = normalized
+                    changes_made = True
+            
+            if changes_made:
+                customer.updated_at = datetime.utcnow()
+                fixed_customers += 1
+        
+        # Recalculate totals for all customers
+        from database import recalculate_customer_totals
+        for customer in all_customers:
+            old_total = customer.total_orders
+            old_count = customer.order_count
+            
+            recalculate_customer_totals(db, customer.id)
+            
+            if customer.total_orders != old_total or customer.order_count != old_count:
+                fixed_customers += 1
+        
+        # Find and merge potential duplicates based on normalized phone
+        phone_groups = {}
+        for customer in all_customers:
+            if customer.phone:
+                if customer.phone not in phone_groups:
+                    phone_groups[customer.phone] = []
+                phone_groups[customer.phone].append(customer)
+            if customer.whatsapp_phone and customer.whatsapp_phone != customer.phone:
+                if customer.whatsapp_phone not in phone_groups:
+                    phone_groups[customer.whatsapp_phone] = []
+                phone_groups[customer.whatsapp_phone].append(customer)
+        
+        # Log potential duplicates (don't auto-merge, just report)
+        duplicates_found = []
+        for phone, customers in phone_groups.items():
+            if len(customers) > 1:
+                duplicates_found.append({
+                    "phone": phone,
+                    "customer_ids": [c.id for c in customers],
+                    "customer_count": len(customers)
+                })
+        
+        db.commit()
+        
+        return {
+            "status": "success",
+            "fixed_customers": fixed_customers,
+            "duplicates_found": len(duplicates_found),
+            "duplicate_details": duplicates_found,
+            "recommendation": "Review duplicate_details and manually merge if needed"
+        }
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Data fix failed: {str(e)}")
+
 def detect_user_choice(message_text: str, options_count: int) -> Optional[int]:
     """
     Detect if user selected a numbered option
