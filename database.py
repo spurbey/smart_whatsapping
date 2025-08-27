@@ -178,33 +178,99 @@ def drop_tables():
 
 # Database utility functions
 
+def normalize_phone_number(phone):
+    """
+    Normalize phone number to consistent format
+    """
+    if not phone:
+        return None
+    
+    # Remove common prefixes and normalize
+    phone = phone.replace('whatsapp:', '').replace('+', '').replace(' ', '').replace('-', '')
+    
+    # Add country code if missing (assuming US +1 for demo)
+    if len(phone) == 10:
+        phone = '1' + phone
+    
+    return '+' + phone
+
 def find_or_create_customer(db, email=None, phone=None, whatsapp_phone=None):
     """
-    Find an existing customer or create a new one
-    This prevents duplicate customers in your database
+    Find an existing customer or create a new one with improved duplicate prevention
     """
-    # Try to find existing customer by email or phone
+    # Normalize phone numbers
+    normalized_phone = normalize_phone_number(phone)
+    normalized_whatsapp = normalize_phone_number(whatsapp_phone)
+    
     customer = None
     
+    # Try to find by email first (most reliable)
     if email:
         customer = db.query(Customer).filter(Customer.email == email).first()
+        if customer:
+            # Update missing phone numbers if found by email
+            if normalized_whatsapp and not customer.whatsapp_phone:
+                customer.whatsapp_phone = normalized_whatsapp
+                customer.updated_at = datetime.utcnow()
+            if normalized_phone and not customer.phone:
+                customer.phone = normalized_phone
+                customer.updated_at = datetime.utcnow()
     
-    if not customer and phone:
-        customer = db.query(Customer).filter(Customer.phone == phone).first()
+    # Try to find by any phone number (normalized)
+    if not customer and (normalized_phone or normalized_whatsapp):
+        search_phones = [p for p in [normalized_phone, normalized_whatsapp] if p]
+        
+        for search_phone in search_phones:
+            customer = db.query(Customer).filter(
+                (Customer.phone == search_phone) |
+                (Customer.whatsapp_phone == search_phone)
+            ).first()
+            if customer:
+                # Update missing information
+                if email and not customer.email:
+                    customer.email = email
+                    customer.updated_at = datetime.utcnow()
+                if normalized_whatsapp and not customer.whatsapp_phone:
+                    customer.whatsapp_phone = normalized_whatsapp
+                    customer.updated_at = datetime.utcnow()
+                if normalized_phone and not customer.phone:
+                    customer.phone = normalized_phone
+                    customer.updated_at = datetime.utcnow()
+                break
     
-    if not customer and whatsapp_phone:
-        customer = db.query(Customer).filter(Customer.whatsapp_phone == whatsapp_phone).first()
-    
-    # If no existing customer found, create new one
+    # Create new customer if none found
     if not customer:
         customer = Customer(
             email=email,
-            phone=phone,
-            whatsapp_phone=whatsapp_phone
+            phone=normalized_phone,
+            whatsapp_phone=normalized_whatsapp
         )
         db.add(customer)
-        db.commit()  # Save to database
-        db.refresh(customer)  # Get the saved version with ID
+        # Don't commit here - let the caller handle transactions
+        db.flush()  # Get the ID without committing
         print(f"✅ Created new customer: {customer.id}")
+    
+    return customer
+
+def recalculate_customer_totals(db, customer_id):
+    """
+    Recalculate customer totals from actual orders
+    """
+    from sqlalchemy import func
+    
+    customer = db.query(Customer).filter(Customer.id == customer_id).first()
+    if not customer:
+        return None
+    
+    # Calculate totals from actual orders
+    totals = db.query(
+        func.count(Order.id).label('order_count'),
+        func.coalesce(func.sum(Order.total_price), 0).label('total_spent')
+    ).filter(Order.customer_id == customer_id).first()
+    
+    # Update customer record
+    customer.order_count = totals.order_count
+    customer.total_orders = float(totals.total_spent)
+    customer.updated_at = datetime.utcnow()
     
     return customer
