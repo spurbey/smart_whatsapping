@@ -17,7 +17,8 @@ import os
 from database import (
     get_database_session, create_tables,
     Customer, Order, Message, WebhookEvent,
-    find_or_create_customer
+    find_or_create_customer,
+    Product, CartItem
 )
 
 # Import WhatsApp integration
@@ -851,6 +852,50 @@ def get_customer_segments(db: Session = Depends(get_db)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
+
+@app.post("/admin/setup-sample-data")
+def setup_sample_data(db: Session = Depends(get_db)):
+    """
+    Setup sample products for testing (no real product table, so just a placeholder)
+    """
+    try:
+        from database import add_sample_products
+        add_sample_products(db)
+        return{"status":"success", "message":"sample products added"}
+    except Exception as e:
+        raise HTTPException(status_code = 500, detail = str(e))
+    
+
+@app.post("/admin/simulate-abandonment")
+def simulate_cart_abdanmonment(customer_phone: str, product_sku: str, db: Session = Depends(get_db)):
+    """
+    Simulate cart abandonment for a customer (for testing)
+    """
+    try:
+        customer = find_or_create_customer(db=db, whatsapp_phone=customer_phone)
+        product = db.query(Product).filter(Product.sku == product_sku).first()
+
+        if not product:
+            raise HTTPException(status_code = 404, detail = "product not found")
+        
+        from database import simulate_cart_abandonment
+        cart_item = simulate_cart_abandonment(db, customer.id, product.id)
+
+        return{
+            "status": "success",
+            "message": f"Simulated cart abandonment for {product.name}",
+            "cart-item_id":cart_item.id
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+        
+
+
+
+
+
+
 def detect_user_choice(message_text: str, options_count: int) -> Optional[int]:
     """
     Detect if user selected a numbered option

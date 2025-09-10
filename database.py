@@ -3,12 +3,13 @@ Database models and connection setup
 This file defines how your data is structured in the database
 """
 
-from sqlalchemy import create_engine, Column, String, Float, DateTime, Text, ForeignKey, Boolean
+from sqlalchemy import create_engine, Column, String, Float, DateTime, Text, ForeignKey, Boolean, Integer
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.dialects.postgresql import UUID
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import uuid
+import json
 
 # Database connection string - replace with your actual database URL
 DATABASE_URL = "postgresql://postgres:water000@localhost:5432/ecommerce_automation"
@@ -55,6 +56,8 @@ class Customer(Base):
     # Relationships - these create connections to other tables
     orders = relationship("Order", back_populates="customer")  # One customer can have many orders
     messages = relationship("Message", back_populates="customer")  # One customer can have many messages
+    cart_items = relationship("CartItem", back_populates="customer")
+    activities = relationship("CustomerActivity", back_populates="customer")
 
 class Order(Base):
     """
@@ -149,6 +152,93 @@ class WebhookEvent(Base):
 
 # Database helper functions
 
+
+class Product(Base):
+    '''
+    prodcut table - stores product informatin
+    '''
+
+    __tablename__ = "products"
+
+    id = Column(String, primary_key = True, default = lambda : str(uuid.uuid4()))
+
+    #product basic info
+
+    name  = Column(String, nullable = False)
+    description = Column(Text, nullable = True)
+    price = Column(Float, nullable = False)
+
+    #Categories
+    category = Column(String, nullable = False)  #  Electronics, Clothing, Home, etc.
+    subcategory = Column(String, nullable = True)
+
+    #inventory details
+    sku = Column(String, unique = True, nullable = False)
+    stock_quantity = Column(Integer, default = 0)
+
+    # Additional fields
+    image_url = Column(String, nullable=True)
+    is_active = Column(Boolean, default=True)
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+    #relationships
+
+    cart_items = relationship("CartItem", back_populates = "product")
+    activities = relationship("CustomerActivity", back_populates="product")
+
+class CartItem(Base):
+    """
+    Shopping cart items - tracks what customers add to cart (for abandonment detection)
+    """
+    __tablename__ = "cart_items"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    
+    # Foreign keys
+    customer_id = Column(String, ForeignKey("customers.id"), nullable=False)
+    product_id = Column(String, ForeignKey("products.id"), nullable=False)
+    
+    # Cart item details
+    quantity = Column(Integer, nullable=False, default=1)
+    price_at_time = Column(Float, nullable=False)  # Price when added to cart
+    
+    # Timestamps
+    added_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    customer = relationship("Customer", back_populates="cart_items")
+    product = relationship("Product", back_populates="cart_items")
+
+class CustomerActivity(Base):
+    """
+    Customer browsing and interaction tracking
+    """
+    __tablename__ = "customer_activities"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    
+    # Foreign keys
+    customer_id = Column(String, ForeignKey("customers.id"), nullable=False)
+    product_id = Column(String, ForeignKey("products.id"), nullable=True)  # Some activities might not involve products
+    
+    # Activity details
+    activity_type = Column(String, nullable=False)  # 'view_product', 'add_to_cart', 'remove_from_cart', etc.
+    metadata_json = Column(Text, nullable=True)  # Store additional data as JSON
+    
+    # Timestamp
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships  
+    customer = relationship("Customer", back_populates="activities")
+    product = relationship("Product", back_populates="activities")
+
+
+
 def get_database_session():
     """
     Create a database session for handling transactions
@@ -208,3 +298,91 @@ def find_or_create_customer(db, email=None, phone=None, whatsapp_phone=None):
         print(f"✅ Created new customer: {customer.id}")
     
     return customer
+
+def add_sample_products(db):
+    """
+    Add sample products to database for testing
+    Call this once to populate product catalog
+    """
+    sample_products = [
+        {
+            "name": "Wireless Bluetooth Headphones",
+            "description": "High-quality wireless headphones with noise cancellation",
+            "price": 99.99,
+            "category": "Electronics",
+            "subcategory": "Audio",
+            "sku": "WBH001",
+            "stock_quantity": 50
+        },
+        {
+            "name": "Smartphone Charging Cable",
+            "description": "Fast charging USB-C cable compatible with most devices",
+            "price": 19.99,
+            "category": "Electronics", 
+            "subcategory": "Accessories",
+            "sku": "SCC002",
+            "stock_quantity": 100
+        },
+        {
+            "name": "Cotton T-Shirt",
+            "description": "Comfortable 100% cotton t-shirt in various colors",
+            "price": 24.99,
+            "category": "Clothing",
+            "subcategory": "Shirts",
+            "sku": "CTS003",
+            "stock_quantity": 75
+        }
+        # Add more products as needed
+    ]
+    
+    for product_data in sample_products:
+        # Check if product already exists
+        existing = db.query(Product).filter(Product.sku == product_data['sku']).first()
+        if not existing:
+            product = Product(**product_data)
+            db.add(product)
+    
+    db.commit()
+    print(f"✅ Added {len(sample_products)} sample products")
+
+def simulate_cart_abandonment(db, customer_id: str, product_id: str, quantity: int = 1):
+    """
+    Simulate a customer adding item to cart (for abandonment testing)
+    """
+    # Get product to get current price
+    product = db.query(Product).filter(Product.id == product_id).first()
+    if not product:
+        return None
+    
+    # Add to cart
+    cart_item = CartItem(
+        customer_id=customer_id,
+        product_id=product_id,
+        quantity=quantity,
+        price_at_time=product.price
+    )
+    db.add(cart_item)
+    
+    # Log activity
+    activity = CustomerActivity(
+        customer_id=customer_id,
+        product_id=product_id,
+        activity_type="add_to_cart",
+        metadata_json=json.dumps({"quantity": quantity, "price": product.price})
+    )
+    db.add(activity)
+    
+    db.commit()
+    return cart_item
+
+def get_abandoned_carts(db, hours_ago: int = 1):
+    """
+    Get carts abandoned more than X hours ago
+    """
+    cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    
+    abandoned_carts = db.query(CartItem).filter(
+        CartItem.added_at <= cutoff_time
+    ).all()
+    
+    return abandoned_carts
