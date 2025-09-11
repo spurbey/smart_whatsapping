@@ -18,11 +18,12 @@ from database import (
     get_database_session, create_tables,
     Customer, Order, Message, WebhookEvent,
     find_or_create_customer,
-    Product, CartItem
+    Product, CartItem, Campaign, CampaignSend
 )
 
 # Import WhatsApp integration
 from whatsapp_integration import WhatsAppService
+from campaign_engine import CampaignEngine
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -30,12 +31,13 @@ logger = logging.getLogger(__name__)
 
 # Initialize WhatsApp service (will be initialized in lifespan)
 whatsapp_service = None
+campaign_engine = None
 
 # Create database tables on startup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- Startup ---
-    global whatsapp_service
+    global whatsapp_service, campaign_engine
     
     # Initialize database
     create_tables()
@@ -44,16 +46,28 @@ async def lifespan(app: FastAPI):
     # Initialize WhatsApp service
     try:
         whatsapp_service = WhatsAppService()
-        print("✅ WhatsApp service initialized!")
+        print(" WhatsApp service initialized!")
     except Exception as e:
-        print(f"⚠️  WhatsApp service failed to initialize: {e}")
+        print(f"  WhatsApp service failed to initialize: {e}")
         print("   (App will continue without WhatsApp features)")
         whatsapp_service = None
+
+    #Initialize Campaign Engine
+    try:
+        if whatsapp_service:
+            campaign_engine = CampaignEngine(whatsapp_service)
+            print("✅ Campaign engine initialized!")
+        else:
+            print("⚠️  Campaign engine not initialized (WhatsApp service unavailable)")
+            campaign_engine = None
+    except Exception as e:
+        print(f"⚠️  Campaign engine failed to initialize: {e}")
+        campaign_engine = None
     
-    print("🚀 API started and all services initialized!")
+    print(" API started and all services initialized!")
     yield
     # --- Shutdown (optional) ---
-    print("👋 API shutting down...")
+    print(" API shutting down...")
 
 app = FastAPI(
     title="E-commerce Automation API",
@@ -889,9 +903,203 @@ def simulate_cart_abdanmonment(customer_phone: str, product_sku: str, db: Sessio
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+# Campaign management endpoints rather than a converstaional
         
 
+@app.post("/admin/setup-campaigns")
+def setup_default_campaigns(db: Session = Depends(get_db)):
+    """
+    Create default cart abandonment campaigns
+    """
+    if not campaign_engine:
+        raise HTTPException(status_code=503, detail="Campaign engine not available")
+    
+    try:
+        created = campaign_engine.create_cart_abandonment_campaigns(db)
+        return {
+            "status": "success",
+            "campaigns_created": created,
+            "message": f"Created {len(created)} campaigns"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/admin/run-campaigns")
+def run_cart_campaigns(db: Session = Depends(get_db)):
+    """
+    Manually trigger cart abandonment campaigns
+    """
+    if not campaign_engine:
+        raise HTTPException(status_code=503, detail="Campaign engine not available")
+    
+    try:
+        result = campaign_engine.run_cart_abandonment_campaigns(db)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/campaigns")
+def list_campaigns(db: Session = Depends(get_db)):
+    """
+    Get all campaigns with statistics
+    """
+    campaigns = db.query(Campaign).all()
+    
+    campaign_stats = []
+    for campaign in campaigns:
+        total_sends = len(campaign.campaign_sends)
+        conversions = len([s for s in campaign.campaign_sends if s.converted])
+        
+        campaign_stats.append({
+            "id": campaign.id,
+            "name": campaign.name,
+            "type": campaign.campaign_type,
+            "trigger_delay_minutes": campaign.trigger_delay_minutes,
+            "offer_type": campaign.offer_type,
+            "offer_value": campaign.offer_value,
+            "is_active": campaign.is_active,
+            "total_sends": total_sends,
+            "conversions": conversions,
+            "conversion_rate": (conversions / total_sends * 100) if total_sends > 0 else 0,
+            "created_at": campaign.created_at.isoformat()
+        })
+    
+    return {
+        "campaigns": campaign_stats,
+        "total_campaigns": len(campaigns)
+    }
+
+@app.get("/campaigns/{campaign_id}/sends")
+def get_campaign_sends(campaign_id: str, limit: int = 50, db: Session = Depends(get_db)):
+    """
+    Get campaign send history for a specific campaign
+    """
+    sends = db.query(CampaignSend).filter(
+        CampaignSend.campaign_id == campaign_id
+    ).order_by(CampaignSend.sent_at.desc()).limit(limit).all()
+    
+    send_history = []
+    for send in sends:
+        send_history.append({
+            "id": send.id,
+            "customer_name": f"{send.customer.first_name or ''} {send.customer.last_name or ''}".strip(),
+            "customer_email": send.customer.email,
+            "sent_at": send.sent_at.isoformat(),
+            "offer_code": send.offer_code_used,
+            "converted": send.converted,
+            "conversion_amount": send.conversion_amount,
+            "message_preview": send.message_content[:100] + "..." if len(send.message_content) > 100 else send.message_content
+        })
+    
+    return {
+        "campaign_sends": send_history,
+        "total_sends": len(sends)
+    }
+
+@app.post("/admin/simulate-cart-abandonment-full")
+def simulate_full_cart_abandonment(
+    customer_phone: str, 
+    product_sku: str, 
+    hours_ago: int = 2,
+    db: Session = Depends(get_db)
+):
+    """
+    Simulate complete cart abandonment flow with campaigns
+    """
+    try:
+        # Find or create customer
+        customer = find_or_create_customer(db=db, whatsapp_phone=customer_phone)
+        
+        # Find product
+        product = db.query(Product).filter(Product.sku == product_sku).first()
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+        
+        # Create abandoned cart (backdated)
+        abandoned_time = datetime.utcnow() - timedelta(hours=hours_ago)
+        
+        cart_item = CartItem(
+            customer_id=customer.id,
+            product_id=product.id,
+            quantity=1,
+            price_at_time=product.price,
+            added_at=abandoned_time
+        )
+        db.add(cart_item)
+        
+        # Log activity
+        from database import CustomerActivity
+        activity = CustomerActivity(
+            customer_id=customer.id,
+            product_id=product.id,
+            activity_type="add_to_cart",
+            created_at=abandoned_time
+        )
+        db.add(activity)
+        
+        db.commit()
+        
+        # If campaign engine available and enough time passed, trigger campaigns
+        triggered_campaigns = []
+        if campaign_engine and hours_ago >= 1:
+            # Find matching campaigns
+            ready_carts = campaign_engine.find_abandoned_carts_for_campaigns(db)
+            matching_carts = [c for c in ready_carts if c["cart"].id == cart_item.id]
+            
+            for cart_data in matching_carts:
+                result = campaign_engine.send_campaign_message(db, cart_data)
+                triggered_campaigns.append(result)
+        
+        return {
+            "status": "success",
+            "message": f"Simulated cart abandonment for {product.name}",
+            "cart_item_id": cart_item.id,
+            "abandoned_hours_ago": hours_ago,
+            "campaigns_triggered": len(triggered_campaigns),
+            "campaign_results": triggered_campaigns
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/webhook/order-completed")
+def order_completed_webhook(order_data: dict, db: Session = Depends(get_db)):
+    """
+    Webhook for when customer completes order (mark cart as recovered)
+    """
+    try:
+        customer_email = order_data.get("customer_email")
+        order_id = order_data.get("order_id")
+        
+        if not customer_email or not order_id:
+            return {"status": "error", "message": "Missing customer_email or order_id"}
+        
+        # Find customer
+        customer = db.query(Customer).filter(Customer.email == customer_email).first()
+        if not customer:
+            return {"status": "error", "message": "Customer not found"}
+        
+        # Find and mark abandoned carts as recovered
+        abandoned_carts = db.query(CartItem).filter(
+            CartItem.customer_id == customer.id,
+            CartItem.is_recovered == False
+        ).all()
+        
+        recovered_count = 0
+        if campaign_engine:
+            for cart in abandoned_carts:
+                if campaign_engine.mark_cart_recovered(db, cart.id, order_id):
+                    recovered_count += 1
+        
+        return {
+            "status": "success",
+            "carts_recovered": recovered_count,
+            "order_id": order_id
+        }
+        
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
 
 
 

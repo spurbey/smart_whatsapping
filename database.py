@@ -209,10 +209,113 @@ class CartItem(Base):
     # Timestamps
     added_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    campaign_sent_count = Column(Integer, default=0)  # How many campaigns sent for this cart
+    last_campaign_sent = Column(DateTime, nullable=True)  # When last campaign was sent
+    is_recovered = Column(Boolean, default=False)  # Did customer complete purchase?
+    recovered_at = Column(DateTime, nullable=True)
+    recovered_order_id = Column(String, nullable=True)  # Link to Order if converted
     
     # Relationships
     customer = relationship("Customer", back_populates="cart_items")
     product = relationship("Product", back_populates="cart_items")
+
+
+class Campaign(Base):
+    """
+    Marketing campaigns for cart abandonment, upselling, etc.
+    """
+    __tablename__ = "campaigns"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    
+    # Campaign details
+    name = Column(String, nullable=False)  # "Cart Abandonment - 1 Hour"
+    campaign_type = Column(String, nullable=False)  # "cart_abandonment", "upsell", "cross_sell"
+    
+    # Trigger conditions
+    trigger_delay_minutes = Column(Integer, default=60)  # Send after 1 hour
+    target_segment = Column(String, default="all")  # "all", "vip", "new"
+    
+    # Campaign content
+    message_template = Column(Text, nullable=False)
+    offer_type = Column(String, nullable=True)  # "discount", "free_shipping", "bundle"
+    offer_value = Column(Float, nullable=True)  # 10 (for 10% discount)
+    offer_code = Column(String, nullable=True)  # "CART10"
+    
+    # Campaign settings
+    is_active = Column(Boolean, default=True)
+    max_sends_per_customer = Column(Integer, default=3)  # Limit spam
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    campaign_sends = relationship("CampaignSend", back_populates="campaign")
+
+
+class CampaignSend(Base):
+    """
+    Track individual campaign message sends to customers
+    """
+    __tablename__ = "campaign_sends"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    
+    # Foreign keys
+    campaign_id = Column(String, ForeignKey("campaigns.id"), nullable=False)
+    customer_id = Column(String, ForeignKey("customers.id"), nullable=False)
+    cart_item_id = Column(String, ForeignKey("cart_items.id"), nullable=True)
+    
+    # Send details
+    message_content = Column(Text, nullable=False)  # Personalized message sent
+    offer_code_used = Column(String, nullable=True)
+    
+    # Tracking
+    sent_at = Column(DateTime, default=datetime.utcnow)
+    opened = Column(Boolean, default=False)
+    clicked = Column(Boolean, default=False)
+    converted = Column(Boolean, default=False)  # Did they complete purchase?
+    conversion_amount = Column(Float, nullable=True)
+    
+    # WhatsApp message tracking
+    whatsapp_message_id = Column(String, nullable=True)
+    
+    # Relationships
+    campaign = relationship("Campaign", back_populates="campaign_sends")
+    customer = relationship("Customer")
+    cart_item = relationship("CartItem")
+
+class OfferCode(Base):
+    """
+    Track promotional offer codes and their usage
+    """
+    __tablename__ = "offer_codes"
+    
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    
+    # Code details
+    code = Column(String, unique=True, nullable=False)  # "CART10OFF"
+    offer_type = Column(String, nullable=False)  # "percentage", "fixed_amount", "free_shipping"
+    offer_value = Column(Float, nullable=False)  # 10.0 for 10% or $10
+    
+    # Usage limits
+    max_uses = Column(Integer, default=1)  # Per customer
+    total_max_uses = Column(Integer, nullable=True)  # Global limit
+    current_uses = Column(Integer, default=0)
+    
+    # Validity
+    expires_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, default=True)
+    
+    # Tracking
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    campaign_id = Column(String, ForeignKey("campaigns.id"), nullable=True)
+
+
 
 class CustomerActivity(Base):
     """
@@ -331,7 +434,34 @@ def add_sample_products(db):
             "subcategory": "Shirts",
             "sku": "CTS003",
             "stock_quantity": 75
-        }
+        },
+        {
+            "name": "Cotton Pant",
+            "description": "Comfortable 100% cotton t-shirt in various colors",
+            "price": 26.99,
+            "category": "Clothing",
+            "subcategory": "Shirts",
+            "sku": "CBS003",
+            "stock_quantity": 75
+        },
+        {
+            "name": "woolen T-Shirt",
+            "description": "Comfortable 100% cotton t-shirt in various colors",
+            "price": 24.99,
+            "category": "Clothing",
+            "subcategory": "Shirts",
+            "sku": "CTA003",
+            "stock_quantity": 75
+        },
+        {
+            "name": "Wireless Bluetooth Speaker",
+            "description": "High-quality wireless headphones with noise cancellation",
+            "price": 99.99,
+            "category": "Electronics",
+            "subcategory": "Audio",
+            "sku": "WBA001",
+            "stock_quantity": 50
+        },
         # Add more products as needed
     ]
     
