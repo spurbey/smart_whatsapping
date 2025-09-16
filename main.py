@@ -24,6 +24,9 @@ from database import (
 # Import WhatsApp integration
 from whatsapp_integration import WhatsAppService
 from campaign_engine import CampaignEngine
+from redis_manager import RedisManager
+from conversation_state import ConversationState
+from support_flow import SupportFlow
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,12 +35,15 @@ logger = logging.getLogger(__name__)
 # Initialize WhatsApp service (will be initialized in lifespan)
 whatsapp_service = None
 campaign_engine = None
+redis_manager = None
+conversation_manager = None
+support_flow_handler = None
 
 # Create database tables on startup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- Startup ---
-    global whatsapp_service, campaign_engine
+    global whatsapp_service, campaign_engine, redis_manager, conversation_manager, support_flow_handler
     
     # Initialize database
     create_tables()
@@ -63,7 +69,23 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️  Campaign engine failed to initialize: {e}")
         campaign_engine = None
-    
+
+    # Initialize Redis and conversation state manager
+    try:
+        redis_manager = RedisManager()
+        if redis_manager.connect():
+            conversation_manager = ConversationState(redis_manager)
+            if conversation_manager:
+                support_flow_handler = SupportFlow(conversation_manager)
+            print("✅ Redis and conversation manager initialized!")
+        else:
+            print("⚠️  Redis connection failed - conversation state disabled")
+            redis_manager = None
+            conversation_manager = None
+    except Exception as e:
+        print(f"⚠️  Redis initialization failed: {e}")
+        redis_manager = None
+        conversation_manager = None
     print(" API started and all services initialized!")
     yield
     # --- Shutdown (optional) ---
@@ -235,7 +257,17 @@ async def twilio_whatsapp_webhook(request: Request, db: Session = Depends(get_db
         db.add(incoming_msg)
         
         # Generate automated response
-        response_text = generate_response(processed_message['message_text'], customer, db)
+        """
+        Testing for enhanced flow system, comment out original response generation
+        """
+        # response_text = generate_response(processed_message['message_text'], customer, db)
+        # Generate response using enhanced flow system
+        response_text = process_message_with_flows(
+            customer.id, 
+            processed_message['message_text'], 
+            customer, 
+            db
+        )
         
         # Save response message to database
         response_msg = Message(
@@ -247,7 +279,8 @@ async def twilio_whatsapp_webhook(request: Request, db: Session = Depends(get_db
             bot_handled=True,
             metadata_json=json.dumps({
                 "triggered_by_message": incoming_msg.id,
-                "response_type": "automated"
+                "response_type": "flow_enhanced" if conversation_manager else "menu_fallback",
+                "has_active_flow": conversation_manager.has_active_session(customer.id) if conversation_manager else False
             })
         )
         db.add(response_msg)
@@ -1102,6 +1135,399 @@ def order_completed_webhook(order_data: dict, db: Session = Depends(get_db)):
         return {"status": "error", "error": str(e)}
 
 
+#Redis Setup for Testing and Operation
+@app.get("/test/redis")
+def test_redis_integration():
+    """
+    Test Redis integration and conversation state
+    """
+    if not redis_manager or not conversation_manager:
+        return {
+            "status": "error",
+            "message": "Redis or conversation manager not available"
+        }
+    
+    # Test Redis connection
+    if not redis_manager.ping():
+        return {
+            "status": "error", 
+            "message": "Redis not responding"
+        }
+    
+    # Test conversation state operations
+    test_customer_id = "test_integration_customer"
+    
+    try:
+        # Create session
+        state = conversation_manager.create_new_session(test_customer_id)
+        
+        # Start flow
+        conversation_manager.start_flow(test_customer_id, "test_flow")
+        
+        # Update state
+        conversation_manager.update_state(test_customer_id, {
+            "current_step": "test_step",
+            "collected_data": {"test": "data"},
+            "metadata.message_count": 1
+        })
+        
+        # Get final state
+        final_state = conversation_manager.get_state(test_customer_id)
+        
+        # Cleanup
+        conversation_manager.clear_session(test_customer_id)
+        
+        return {
+            "status": "success",
+            "message": "Redis integration working perfectly!",
+            "test_results": {
+                "session_created": state["session_id"],
+                "flow_started": final_state["current_flow"] == "test_flow",
+                "state_updated": final_state["current_step"] == "test_step",
+                "data_stored": final_state["collected_data"]["test"] == "data",
+                "metadata_updated": final_state["metadata"]["message_count"] == 1
+            }
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Redis test failed: {str(e)}"
+        }
+# Add endpoint to view active conversations (for debugging)
+@app.get("/admin/conversations")
+def list_active_conversations():
+    """
+    List active conversation sessions (for debugging)
+    """
+    if not redis_manager:
+        return {"error": "Redis not available"}
+    
+    try:
+        # Get all conversation keys
+        keys = redis_manager.client.keys("conversation:*")
+        
+        conversations = []
+        for key in keys:
+            try:
+                state = redis_manager.get_data(key)
+                if state:
+                    conversations.append({
+                        "key": key,
+                        "customer_id": state.get("customer_id"),
+                        "session_id": state.get("session_id"), 
+                        "current_flow": state.get("current_flow"),
+                        "current_step": state.get("current_step"),
+                        "last_activity": state.get("metadata", {}).get("last_activity"),
+                        "message_count": state.get("metadata", {}).get("message_count", 0),
+                        "ttl": redis_manager.get_ttl(key)
+                    })
+            except Exception as e:
+                logger.warning(f"Error reading conversation {key}: {e}")
+        
+        return {
+            "active_conversations": len(conversations),
+            "conversations": conversations
+        }
+        
+    except Exception as e:
+        return {"error": f"Failed to list conversations: {str(e)}"}
+
+# Add endpoint to manually create conversation session (for testing)
+@app.post("/admin/conversations/create")
+def create_test_conversation(customer_phone: str, flow_name: str = "support"):
+    """
+    Create a test conversation session
+    """
+    if not conversation_manager:
+        return {"error": "Conversation manager not available"}
+    
+    try:
+        # Find or create customer
+        db = get_database_session()
+        try:
+            customer = find_or_create_customer(db=db, whatsapp_phone=customer_phone)
+            customer_id = customer.id
+        finally:
+            db.close()
+        
+        # Create conversation session
+        state = conversation_manager.create_new_session(customer_id)
+        
+        # Start specified flow
+        if flow_name:
+            conversation_manager.start_flow(customer_id, flow_name)
+            state = conversation_manager.get_state(customer_id)
+        
+        return {
+            "status": "success",
+            "message": f"Created conversation session for {customer_phone}",
+            "session_id": state["session_id"],
+            "customer_id": customer_id,
+            "current_flow": state["current_flow"]
+        }
+        
+    except Exception as e:
+        return {"error": f"Failed to create conversation: {str(e)}"}
+
+# Add endpoint to clear conversation session (for testing)
+@app.delete("/admin/conversations/{customer_phone}")
+def clear_conversation(customer_phone: str):
+    """
+    Clear conversation session for a customer
+    """
+    if not conversation_manager:
+        return {"error": "Conversation manager not available"}
+    
+    try:
+        # Find customer
+        db = get_database_session()
+        try:
+            customer = db.query(Customer).filter(
+                Customer.whatsapp_phone == customer_phone
+            ).first()
+            
+            if not customer:
+                return {"error": "Customer not found"}
+            
+            customer_id = customer.id
+        finally:
+            db.close()
+        
+        # Clear conversation session
+        if conversation_manager.clear_session(customer_id):
+            return {
+                "status": "success",
+                "message": f"Cleared conversation session for {customer_phone}"
+            }
+        else:
+            return {"error": "Failed to clear session or no active session"}
+            
+    except Exception as e:
+        return {"error": f"Failed to clear conversation: {str(e)}"}
+# Add endpoint to test support flow via API
+@app.post("/test/support-flow")
+def test_support_flow_api(customer_phone: str, message: str):
+    """
+    Test support flow via API call
+    """
+    if not support_flow_handler or not conversation_manager:
+        return {"error": "Support flow not available"}
+    
+    try:
+        # Find or create customer
+        db = get_database_session()
+        try:
+            customer = find_or_create_customer(db=db, whatsapp_phone=customer_phone)
+            customer_id = customer.id
+        finally:
+            db.close()
+        
+        # Process message through flow system
+        response = process_message_with_flows(customer_id, message, customer, db)
+        
+        # Get current conversation state
+        current_state = conversation_manager.get_state(customer_id)
+        
+        return {
+            "status": "success",
+            "response": response,
+            "conversation_state": {
+                "has_active_flow": current_state is not None,
+                "current_flow": current_state.get("current_flow") if current_state else None,
+                "current_step": current_state.get("current_step") if current_state else None,
+                "session_id": current_state.get("session_id") if current_state else None
+            }
+        }
+        
+    except Exception as e:
+        return {"error": f"Failed to process message: {str(e)}"}
+
+# Add endpoint to simulate complete support conversation
+@app.post("/test/support-conversation")
+def simulate_support_conversation(customer_phone: str):
+    """
+    Simulate a complete support conversation flow
+    """
+    if not support_flow_handler or not conversation_manager:
+        return {"error": "Support flow not available"}
+    
+    try:
+        # Find or create customer
+        db = get_database_session()
+        try:
+            customer = find_or_create_customer(db=db, whatsapp_phone=customer_phone)
+            customer_id = customer.id
+        finally:
+            db.close()
+        
+        # Simulate conversation steps
+        conversation_steps = [
+            "I have an issue with my order",
+            "1",  # Order issue
+            "My order #1234 hasn't arrived yet and it's been 5 days",
+            "test@example.com",
+            "1"   # Issue resolved
+        ]
+        
+        responses = []
+        
+        for i, user_message in enumerate(conversation_steps):
+            response = process_message_with_flows(customer_id, user_message, customer, db)
+            
+            # Get current state
+            current_state = conversation_manager.get_state(customer_id)
+            
+            step_result = {
+                "step": i + 1,
+                "user_message": user_message,
+                "bot_response": response,
+                "current_flow": current_state.get("current_flow") if current_state else None,
+                "current_step": current_state.get("current_step") if current_state else None
+            }
+            
+            responses.append(step_result)
+            
+            # Small delay to make it feel more realistic
+            import time
+            time.sleep(0.1)
+        
+        return {
+            "status": "success",
+            "message": "Simulated complete support conversation",
+            "conversation": responses,
+            "final_state": "Flow completed" if not conversation_manager.has_active_session(customer_id) else "Flow still active"
+        }
+        
+    except Exception as e:
+        return {"error": f"Simulation failed: {str(e)}"}
+
+# Add diagnostic endpoint
+@app.get("/admin/flow-status/{customer_phone}")
+def get_customer_flow_status(customer_phone: str):
+    """
+    Get current flow status for a customer
+    """
+    if not conversation_manager:
+        return {"error": "Conversation manager not available"}
+    
+    try:
+        # Find customer
+        db = get_database_session()
+        try:
+            customer = db.query(Customer).filter(
+                Customer.whatsapp_phone == customer_phone
+            ).first()
+            
+            if not customer:
+                return {"error": "Customer not found"}
+            
+            customer_id = customer.id
+        finally:
+            db.close()
+        
+        # Get conversation state
+        current_state = conversation_manager.get_state(customer_id)
+        
+        if not current_state:
+            return {
+                "customer_phone": customer_phone,
+                "customer_id": customer_id,
+                "has_active_conversation": False,
+                "status": "No active conversation"
+            }
+        
+        # Get Redis TTL for session
+        redis_key = conversation_manager.get_conversation_key(customer_id)
+        ttl_seconds = redis_manager.get_ttl(redis_key)
+        
+        return {
+            "customer_phone": customer_phone,
+            "customer_id": customer_id,
+            "has_active_conversation": True,
+            "session_id": current_state.get("session_id"),
+            "current_flow": current_state.get("current_flow"),
+            "current_step": current_state.get("current_step"),
+            "message_count": current_state.get("metadata", {}).get("message_count", 0),
+            "started_at": current_state.get("metadata", {}).get("created_at"),
+            "last_activity": current_state.get("metadata", {}).get("last_activity"),
+            "collected_data": current_state.get("collected_data", {}),
+            "session_expires_in_seconds": ttl_seconds,
+            "session_expires_in_minutes": round(ttl_seconds / 60, 1) if ttl_seconds > 0 else 0
+        }
+        
+    except Exception as e:
+        return {"error": f"Failed to get flow status: {str(e)}"}
+    
+def process_message_with_flows(customer_id: str, message_text: str, customer, db) -> str:
+    """
+    Process WhatsApp message with conversation flow support
+    Falls back to original menu system if flows are unavailable
+    """
+    if not conversation_manager or not support_flow_handler:
+        # Fall back to original system
+        return generate_response(message_text, customer, db)
+    
+    try:
+        # Check if customer has active conversation
+        current_state = conversation_manager.get_state(customer_id)
+        
+        # Check for flow interruption/escape commands
+        if message_text.lower().strip() in ["menu", "start over", "cancel", "main menu", "back"]:
+            if current_state and current_state.get("current_flow"):
+                # Clear current flow and return to menu
+                conversation_manager.clear_session(customer_id)
+                return generate_main_menu_response(customer)
+            else:
+                # No active flow, just show menu
+                return generate_response(message_text, customer, db)
+        
+        # If there's an active flow, continue it
+        if current_state and current_state.get("current_flow"):
+            if current_state["current_flow"] == "support":
+                response, updated_state = support_flow_handler.process_support_message(
+                    customer_id, message_text
+                )
+                return response
+            else:
+                # Unknown flow - clear and fall back
+                conversation_manager.clear_session(customer_id)
+                return generate_response(message_text, customer, db)
+        
+        # No active flow - determine if we should start one
+        if should_start_support_flow(message_text):
+            response, state = support_flow_handler.start_support_flow(customer_id, message_text)
+            return response
+        else:
+            # Use original menu system
+            return generate_response(message_text, customer, db)
+            
+    except Exception as e:
+        logger.error(f"Error in flow processing: {e}")
+        # Fall back to original system on any error
+        return generate_response(message_text, customer, db)
+    
+def should_start_support_flow(message_text: str) -> bool:
+    """
+    Determine if message should trigger support flow
+    """
+    message_lower = message_text.lower()
+    
+    # Support trigger words
+    support_keywords = [
+        "help", "issue", "problem", "support", "error", "wrong", "not working",
+        "order issue", "delivery", "refund", "return", "complaint", "question",
+        "where is", "haven't received", "broken", "damaged"
+    ]
+    
+    return any(keyword in message_lower for keyword in support_keywords)
+
+def generate_main_menu_response(customer) -> str:
+    """
+    Generate main menu response (fallback/escape from flows)
+    """
+    name = customer.first_name or "there"
+    return f"Hi {name}! 👋 How can I help you today?\n\n1. 📦 My Orders\n2. 🛍️ Products\n3. 🆘 Support\n4. 👤 My Account\n\nReply with the number of your choice, or describe your issue and I'll help!"
 
 
 def detect_user_choice(message_text: str, options_count: int) -> Optional[int]:
